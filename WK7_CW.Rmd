@@ -1,0 +1,21 @@
+---
+title: GIS Week 7: Spatial Autocorrelataion
+date: 20/11/25
+---
+
+```{r}
+#Installing relevant packages.
+
+library(here)
+library(janitor)
+library(sf)
+library(tidyverse)
+
+#Reading in London Ward data.
+LondonWards <- st_read(here::here("London-wards-2018/London-wards-2018_ESRI/London_Ward.shp"))
+
+#Reading in London Wards (Merged).
+LondonWardsMerged <- st_read(here::here())
+
+```
+
