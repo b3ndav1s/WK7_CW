@@ -3,6 +3,8 @@ title: GIS Week 7: Spatial Autocorrelataion
 date: 20/11/25
 ---
 
+#Packages, Data Read-in, Initial Cleaning
+
 ```{r}
 #Installing relevant packages.
 
@@ -10,12 +12,201 @@ library(here)
 library(janitor)
 library(sf)
 library(tidyverse)
+library(tmap)
 
 #Reading in London Ward data.
 LondonWards <- st_read(here::here("London-wards-2018/London-wards-2018_ESRI/London_Ward.shp"))
 
 #Reading in London Wards (Merged).
-LondonWardsMerged <- st_read(here::here())
+LondonWardsMerged <- st_read(here::here("London-wards-2018/London-wards-2018_ESRI/London_Ward_CityMerged.shp")) %>% 
+  st_transform(., 27700)
+
+#Reading in the ward GCSE data.
+WardData <- read_csv("https://data.london.gov.uk/download/f33fb38c-cb37-48e3-8298-84c0d3cc5a6c/772d2d64-e8c6-46cb-86f9-e52b4c7851bc/ward-profiles-excel-version.csv",
+                    locale = locale(encoding = "latin1"),
+                     na = c("NA", "n/a")) %>% 
+  clean_names()
+
+LondonWardsMerged <- LondonWardsMerged %>% 
+  left_join(WardData, 
+            by = c("GSS_CODE" = "new_code"))%>%
+  dplyr::distinct(GSS_CODE, .keep_all = T)%>%
+  dplyr::select(GSS_CODE, ward_name, average_gcse_capped_point_scores_2014)
+
+#Reading in [and cleaning] the Blue Plaques data. Corrects the CRS for BluePlaques (WGS84 -> BNG).
+BluePlaques <- st_read("https://s3.eu-west-2.amazonaws.com/openplaques/open-plaques-london-2018-04-08.geojson") %>% 
+  st_transform(., 27700)
+BluePlaques <- BluePlaques[LondonWardsMerged,]
+
+#Quick plot to check both LondonWardsMerged and BluePlaques. Makes sure that no blue plaques plot outside the wards.
+tmap_mode("plot")
+tm_shape(LondonWardsMerged) +
+  tm_polygons() +
+  tm_shape(BluePlaques) +
+  tm_dots()
 
 ```
+
+# Data Manipulation 
+
+```{r}
+
+#Checking how st_intersects works in this context.
+Example <- st_intersects(LondonWardsMerged, BluePlaques)
+
+#Counting the number of plaques/ ward.
+points_sf_joined <- LondonWardsMerged%>%
+  mutate(n = lengths(st_intersects(., BluePlaques)))%>%
+  janitor::clean_names()%>%
+  #calculate area
+  mutate(area=st_area(.))%>%
+  #then density of the points per ward
+  mutate(density=n/area)%>%
+  #select density and some other variables 
+  dplyr::select(density, ward_name, gss_code, n, average_gcse_capped_point_scores_2014)
+
+#Getting one row per ward.
+points_sf_joined <- points_sf_joined %>% 
+  group_by(gss_code) %>% 
+  summarise(density = first(density),
+            wardname = first(ward_name), 
+            plaquecount = first(n))
+
+#Basic plaque density map.
+tm_shape(points_sf_joined) +
+  tm_polygons(fill = "density",
+              fill.scale = tm_scale_intervals(values = "brewer.blues", style = "jenks"))
+
+```
+
+# Spatial Autocorrelation
+
+```{r}
+#Set up
+
+install.packages("spdep")
+library(spdep)
+
+#Calculating ward centroids.
+WardCoords <- points_sf_joined %>% 
+  st_centroid() %>% 
+  st_geometry()
+
+plot(WardCoords, axes=TRUE)
+
+#Creating a neighbours list and fetching the summary data. 
+LWard_nb <- points_sf_joined %>% 
+  poly2nb(., queen=T)
+summary(LWard_nb)
+
+#The average number of links (neighbours) is 5.9.
+
+#Plots the ward neighbours.
+plot(LWard_nb, st_geometry(WardCoords), col="red")
+plot(points_sf_joined$geometry, add=T)
+
+
+#Spatial weights matrix
+LWard_lw <- LWard_nb %>% 
+  nb2mat(., style = "B")
+sum(LWard_lw)
+
+LWard_lw <- LWard_nb %>% 
+  nb2listw(., style="C")
+
+```
+
+```{r}
+#Moran's I
+
+#This tells us whether the plaques are clustered (values close to 1) or dispersed (close to -1). Random values would produce a result of 0. 
+
+MoranI <- points_sf_joined %>% 
+  pull(density) %>% 
+  as.vector() %>% 
+  moran.test(., LWard_lw)
+
+MoranI
+
+#Our Moran's I statistic is 0.67 compared to an expectation of -0.002 (~complete spatial randomness). This indicates strong positive spatial autocorrelation and non-random clustering of high-high and low-low areas. P-value of 2.2x10^-16 confirms statistical significance.
+
+```
+```{r}
+#Geary's C
+
+#Calculating Geary's C to tell us whether similar or dissimilar values are clustering. 
+
+Geary_C <- points_sf_joined %>% 
+  pull(density) %>% 
+  as.vector() %>% 
+  geary.test(., LWard_lw)
+
+Geary_C
+
+#The Geary's C statistic is 0.41 relative to an expectation of 1 (complete spatial randomness). This indicates that there is strong positive spatial autocorrelation at the local level in addition to the global level (0.67 Moran's I). Neighbouring wards have similar plaque densities - there are few sharp contrasts.
+
+```
+
+```{r}
+#Getis Ord General G
+
+#Calculates General G
+GeneralG <- points_sf_joined %>% 
+  pull(density) %>% 
+  as.vector() %>% 
+  globalG.test(., LWard_lw)
+
+#N.b for this test it whether the statistic is more, less or ~equal than/to the expectation (under spatial randomness). 
+
+GeneralG
+
+#Our statistic of 1.13x10^-2 is greater than the CSR expectation of 1.58x10^-3 indicating a significant (p = 2.2x10^-16) global hotspot pattern.
+
+```
+
+```{r}
+#Local Moran's I
+
+LocalMoranCount <- points_sf_joined %>%
+  pull(plaquecount) %>%
+  as.vector()%>%
+  localmoran(., LWard_lw)%>%
+  as_tibble()
+
+LocalMoranDensity <- points_sf_joined %>%
+  pull(density) %>%
+  as.vector()%>%
+  localmoran(., LWard_lw)%>%
+  as_tibble()
+
+
+slice_head(LocalMoran, n=5)
+
+points_sf_joined <- points_sf_joined %>% 
+  mutate(Plaque_Count_I = as.numeric(LocalMoranCount$Ii)) %>% mutate(plaque_count_Iz =as.numeric(LocalMoranCount$Z.Ii))%>%
+  mutate(density_I =as.numeric(LocalMoranDensity$Ii))%>%
+  mutate(density_Iz =as.numeric(LocalMoranDensity$Z.Ii))
+
+breaks1 <- c(-1000, -2.58,-1.96, -1.65, 1.96, 2.58, 1000)
+library
+MoranColours <- rev(brewer.pal(7, "RdGy"))
+
+```
+
+```{r}
+#Mapping 
+
+tm_shape(points_sf_joined) +
+  tm_polygons(
+    fill = "plaque_count_Iz", fill.scale =tm_scale_intervals(values = "brewer.br_bg", midpoint = "NA", style = "fixed", breaks = breaks1), fill.legend = tm_legend(title = "Local Moran's I, Blue Plaques in London", position = tm_pos_out("right", "center", pos.v = "center")))
+
+
+```
+
+
+
+
+
+
+
 
